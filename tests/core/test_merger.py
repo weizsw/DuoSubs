@@ -227,6 +227,137 @@ def test_align_subs_using_neighbours(case: AlignSubsNeighbourTest, stop: bool) -
         assert stage_number == 1
         assert_subtitle_fields_equal(output_subs, expected_subs)
 
+
+@pytest.mark.parametrize(
+    "third_start, third_end, am_start, original_middle, reflows",
+    [
+        pytest.param(
+            496371, 498540, 497664, "我是说 敢死和加拿大相比", True,
+            id="contiguous",
+        ),
+        pytest.param(
+            506371, 508540, 507664, "我是说敢死和加拿大相比", False,
+            id="timing-gap",
+        ),
+        pytest.param(
+            495000, 498540, 497664, "我是说敢死和加拿大相比", False,
+            id="timing-overlap",
+        ),
+        pytest.param(
+            496320, 498540, 497664, "我是说敢死和加拿大相比", False,
+            id="small-timing-overlap",
+        ),
+    ],
+)
+def test_merge_subtitle_reflows_primary_text_across_cue_boundary(
+        third_start: int,
+        third_end: int,
+        am_start: int,
+        original_middle: str,
+        reflows: bool
+    ) -> None:
+    """Keep translated clauses together only across contiguous synced cues."""
+    primary_tokens = [
+        "你们到底有没有个计划？",  # noqa: RUF001
+        "我是说",
+        "敢死和加拿大相比",
+        "真难抉择啊",
+        "我说得对吧？",  # noqa: RUF001
+    ]
+    secondary_tokens = [
+        "Do you even have a plan?",
+        "I mean,",
+        "suicide versus Canada,",
+        "it's a real horse race.",
+        "Am I right?",
+    ]
+    original_primary_texts = [
+        primary_tokens[0],
+        original_middle,
+        " ".join(primary_tokens[3:5]),
+    ]
+    primary_subs = [
+        SubtitleField(
+            start=493160,
+            end=494785,
+            primary_token_spans=(0, 1),
+            primary_text=original_primary_texts[0],
+            primary_style="First",
+        ),
+        SubtitleField(
+            start=494786,
+            end=496370,
+            primary_token_spans=(1, 3),
+            primary_text=original_primary_texts[1],
+            primary_style="Second",
+        ),
+        SubtitleField(
+            start=third_start,
+            end=third_end,
+            primary_token_spans=(3, 5),
+            primary_text=original_primary_texts[2],
+            primary_style="Third",
+        ),
+    ]
+    secondary_subs = [
+        SubtitleField(
+            start=493160,
+            end=494785,
+            primary_token_spans=(0, 2),
+            primary_text=" ".join(secondary_tokens[0:2]),
+        ),
+        SubtitleField(
+            start=494786,
+            end=497663,
+            primary_token_spans=(2, 4),
+            primary_text=" ".join(secondary_tokens[2:4]),
+        ),
+        SubtitleField(
+            start=am_start,
+            end=third_end,
+            primary_token_spans=(4, 5),
+            primary_text=secondary_tokens[4],
+        ),
+    ]
+    merger = Merger(
+        SubtitleData(
+            subs=primary_subs,
+            tokens=primary_tokens,
+            styles_tokens=["First", "Second", "Second", "Third", "Third"],
+        ),
+        SubtitleData(
+            subs=secondary_subs,
+            tokens=secondary_tokens,
+            styles_tokens=["Default"] * len(secondary_tokens),
+        ),
+    )
+
+    result = merger.merge_subtitle(
+        cast(SentenceTransformer, BoundaryModel()),
+        [False],
+    )
+
+    expected_primary_texts = (
+        [
+            "你们到底有没有个计划？",  # noqa: RUF001
+            "我是说 敢死和加拿大相比 真难抉择啊",
+            "我说得对吧？",  # noqa: RUF001
+        ]
+        if reflows
+        else original_primary_texts
+    )
+    assert [sub.primary_text for sub in result] == expected_primary_texts
+    assert [sub.secondary_text for sub in result] == [
+        "Do you even have a plan?",
+        "I mean, suicide versus Canada, it's a real horse race.",
+        "Am I right?",
+    ]
+    assert [(sub.start, sub.end, sub.primary_style) for sub in result] == [
+        (493160, 494785, "First"),
+        (494786, 496370, "Second"),
+        (third_start, third_end, "Third"),
+    ]
+
 @pytest.mark.parametrize(
     "case",
     cast(list[EliminateNewlineTest], load_test_cases(DATA_ELIMINATE_NEWLINE))
@@ -522,6 +653,38 @@ def test_get_progress_percentage(case: GetProgressPercentageTest) -> None:
 # ------------------------
 # Test Helpers / Stubs
 # ------------------------
+
+
+class BoundaryModel:
+    """Deterministic bilingual embeddings for the cue-boundary regression test."""
+
+    concepts = (
+        ("计划", "plan"),
+        ("我是说", "I mean"),
+        ("敢死和加拿大相比", "suicide versus Canada"),
+        ("真难抉择啊", "horse race"),
+        ("我说得对吧", "Am I right"),
+    )
+
+    def encode(
+            self,
+            texts: str | list[str],
+            **_kwargs: Any
+        ) -> torch.Tensor:
+        """Encode known Chinese and English clauses into shared concept vectors."""
+        items = [texts] if isinstance(texts, str) else texts
+        embeddings = []
+        for text in items:
+            embedding = torch.tensor([
+                float(chinese in text or english in text)
+                for chinese, english in self.concepts
+            ])
+            if text == "我是说 敢死和加拿大相比":
+                embedding[3] = 0.7
+            elif text == "真难抉择啊 我说得对吧？":  # noqa: RUF001
+                embedding[3] = 0
+            embeddings.append(embedding)
+        return torch.stack(embeddings)
 
 class DummyModel:
     """

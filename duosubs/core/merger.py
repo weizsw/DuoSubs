@@ -115,6 +115,14 @@ class Merger:
                 progress_callback
             )
 
+        if not ignore_non_overlap_filter:
+            processed_subs = self.refine_primary_boundaries(
+                processed_subs,
+                model,
+                stop_bit,
+                batch_size
+            )
+
         processed_subs.extend(non_overlap_primary_subs)
         processed_subs.extend(non_overlap_secondary_subs)
         processed_subs.sort()
@@ -429,6 +437,75 @@ class Merger:
         stage_number += 1
         subs.sort()
         return subs, stage_number
+
+    def refine_primary_boundaries(
+            self,
+            subs: list[SubtitleField],
+            model: SentenceTransformer,
+            stop_bit: list[bool],
+            batch_size: int = 32
+        ) -> list[SubtitleField]:
+        """Refine adjacent primary cue boundaries against aligned secondary text."""
+        for sub_idx in range(len(subs) - 1):
+            if stop_bit[0]:
+                break
+            left_sub = subs[sub_idx]
+            right_sub = subs[sub_idx + 1]
+            token_start = left_sub.primary_token_spans[0]
+            current_split = left_sub.primary_token_spans[1]
+            token_end = right_sub.primary_token_spans[1]
+
+            if (
+                current_split != right_sub.primary_token_spans[0]
+                or not token_start < current_split < token_end
+                or token_end > len(self._primary_tokens)
+                or not 0 <= right_sub.start - left_sub.end <= 100
+                or not left_sub.secondary_text
+                or not right_sub.secondary_text
+            ):
+                continue
+
+            split_indices = [current_split] + [
+                split_idx
+                for split_idx in range(token_start + 1, token_end)
+                if split_idx != current_split
+            ]
+            if len(split_indices) == 1:
+                continue
+            primary_text_left = [
+                " ".join(self._primary_tokens[token_start:split_idx])
+                for split_idx in split_indices
+            ]
+            primary_text_right = [
+                " ".join(self._primary_tokens[split_idx:token_end])
+                for split_idx in split_indices
+            ]
+            left_score = Merger._compute_score(
+                left_sub.secondary_text,
+                primary_text_left,
+                model,
+                batch_size
+            )
+            right_score = Merger._compute_score(
+                right_sub.secondary_text,
+                primary_text_right,
+                model,
+                batch_size
+            )
+            _, best_match_idx = torch.max(left_score + right_score, dim=1)
+            score_idx = int(best_match_idx.item())
+            token_split = split_indices[score_idx]
+            if token_split == current_split:
+                continue
+
+            left_sub.primary_token_spans = (token_start, token_split)
+            left_sub.primary_text = primary_text_left[score_idx]
+            left_sub.score = left_score[0][score_idx].item()
+            right_sub.primary_token_spans = (token_split, token_end)
+            right_sub.primary_text = primary_text_right[score_idx]
+            right_sub.score = right_score[0][score_idx].item()
+
+        return subs
     
     def filter_and_extract_extended_version(
             self,
